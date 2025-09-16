@@ -130,12 +130,10 @@ async function fetchData() {
         byId.set(t.id, t);
       }
     });
-    // Compute a momentum score biased toward short-term movement.
-    // We favor the 1h percentage change, with a small contribution from the 24h change.
-    // Then multiply by the square root of the volume-to-market-cap ratio to dampen extremes.
+    // Compute category (pumping or dumping) and movement completion based on 24h price range.
+    // We approximate the open price using the 24h price change percentage and current price.
     data.forEach((token) => {
-      // Extract 1h and 24h price change percentages from the API response.
-      // CoinGecko returns keys like price_change_percentage_1h_in_currency or price_change_percentage_1h depending on the endpoint.
+      // Use 1h and 24h price change percentages to determine short‑term direction
       const priceChange1h =
         typeof token.price_change_percentage_1h_in_currency === "number"
           ? token.price_change_percentage_1h_in_currency
@@ -146,36 +144,57 @@ async function fetchData() {
         typeof token.price_change_percentage_24h === "number"
           ? token.price_change_percentage_24h
           : 0;
-      // Calculate a relative volume ratio; use square root to compress range
-      const volumeRatio =
-        token.market_cap && token.market_cap > 0
-          ? Math.sqrt(token.total_volume / token.market_cap)
-          : 0;
-      // Apply a small contribution from 24h change and a bonus if the token is trending
-      const trendMultiplier = token.isTrending ? 1.5 : 1;
-      // Combine the components into a momentum score
-      token.score = (priceChange1h + 0.1 * priceChange24h) * volumeRatio * trendMultiplier;
+      // Approximate the opening price 24h ago: current_price / (1 + change24h/100)
+      const openPrice = priceChange24h !== -100
+        ? token.current_price / (1 + priceChange24h / 100)
+        : token.current_price;
+      // Compute category based on 1h change
+      let category = "neutral";
+      if (priceChange1h > 0) {
+        category = "pumping";
+      } else if (priceChange1h < 0) {
+        category = "dumping";
+      }
+      // Compute movement completion percentage
+      let completion = 0;
+      if (category === "pumping") {
+        const moveRange = token.high_24h - openPrice;
+        const progress = token.current_price - openPrice;
+        if (moveRange > 0) {
+          completion = (progress / moveRange) * 100;
+        }
+      } else if (category === "dumping") {
+        const moveRange = openPrice - token.low_24h;
+        const progress = openPrice - token.current_price;
+        if (moveRange > 0) {
+          completion = (progress / moveRange) * 100;
+        }
+      }
+      // Clamp completion between 0 and 100
+      completion = Math.max(0, Math.min(100, completion));
+      token.category = category;
+      token.completion = completion;
     });
-    // Filter out tokens with minimal activity (price change <= 0 or volume <= 0)
+    // Filter to tokens likely available on Blofin: top 200 by market cap rank and non-zero volume
     const filtered = data.filter(
       (token) =>
-        token.total_volume > 0 && typeof token.score === "number" && token.score > 0
+        token.total_volume > 0 &&
+        token.market_cap_rank &&
+        token.market_cap_rank <= 200 &&
+        token.high_24h &&
+        token.low_24h &&
+        typeof token.completion === "number"
     );
-    // Sort by score descending
-    filtered.sort((a, b) => b.score - a.score);
-    // Take top 100 tokens to display
+    // Sort tokens by completion descending to surface those closest to completing their move
+    filtered.sort((a, b) => b.completion - a.completion);
+    // Take top 100 tokens
     const topTokens = filtered.slice(0, 100);
     tokens = topTokens;
     filteredTokens = [...tokens];
     if (tokens.length === 0) {
       statusEl.textContent =
-        "No tokens found with significant momentum. Try again later.";
+        "No Blofin‑listed tokens with sufficient data found. Try again later.";
     } else {
-      // Compute max score to normalize probabilities
-      const maxScore = tokens[0].score || 0;
-      tokens.forEach((token) => {
-        token.probability = maxScore > 0 ? token.score / maxScore : 0;
-      });
       statusEl.style.display = "none";
       tokensTable.classList.remove("hidden");
       renderTable(filteredTokens);
@@ -223,6 +242,40 @@ function renderTable(list) {
     const symbolCell = document.createElement("td");
     symbolCell.textContent = token.symbol.toUpperCase();
     row.appendChild(symbolCell);
+    // Category (pumping, dumping, neutral)
+    const catCell = document.createElement("td");
+    let catLabel = token.category ? token.category.charAt(0).toUpperCase() + token.category.slice(1) : "Neutral";
+    catCell.textContent = catLabel;
+    // Set category color: green for pumping, red for dumping, gray for neutral
+    if (token.category === "pumping") {
+      catCell.style.color = "#00ff99";
+    } else if (token.category === "dumping") {
+      catCell.style.color = "#ff4444";
+    } else {
+      catCell.style.color = "#cccccc";
+    }
+    row.appendChild(catCell);
+    // Completion percentage
+    const completionCell = document.createElement("td");
+    completionCell.classList.add("numeric");
+    const compPercent = token.completion ? token.completion.toFixed(1) : 0;
+    completionCell.textContent = `${compPercent}%`;
+    // Color-code completion: if pumping, greener as it approaches 100%; if dumping, redder as it approaches 100%
+    const compValue = parseFloat(compPercent);
+    if (token.category === "pumping") {
+      if (compValue >= 80) completionCell.style.color = "#00ff00";
+      else if (compValue >= 50) completionCell.style.color = "#66ff66";
+      else if (compValue >= 20) completionCell.style.color = "#99ff99";
+      else completionCell.style.color = "#cccccc";
+    } else if (token.category === "dumping") {
+      if (compValue >= 80) completionCell.style.color = "#ff0000";
+      else if (compValue >= 50) completionCell.style.color = "#ff3333";
+      else if (compValue >= 20) completionCell.style.color = "#ff6666";
+      else completionCell.style.color = "#cccccc";
+    } else {
+      completionCell.style.color = "#cccccc";
+    }
+    row.appendChild(completionCell);
     // Price
     const priceCell = document.createElement("td");
     priceCell.classList.add("numeric");
@@ -248,24 +301,6 @@ function renderTable(list) {
     capCell.classList.add("numeric");
     capCell.textContent = `$${formatNumber(token.market_cap)}`;
     row.appendChild(capCell);
-
-    // Moon Probability
-    const probCell = document.createElement("td");
-    probCell.classList.add("numeric");
-    const probPercent = token.probability ? (token.probability * 100).toFixed(1) : 0;
-    probCell.textContent = `${probPercent}%`;
-    // Color-code probability: greener for higher probability
-    const probValue = parseFloat(probPercent);
-    if (probValue >= 80) {
-      probCell.style.color = "#00ff00";
-    } else if (probValue >= 50) {
-      probCell.style.color = "#66ff66";
-    } else if (probValue >= 20) {
-      probCell.style.color = "#99ff99";
-    } else {
-      probCell.style.color = "#cccccc";
-    }
-    row.appendChild(probCell);
     tokensBody.appendChild(row);
   });
 }
