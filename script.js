@@ -1,13 +1,14 @@
 /*
  * Gem Finder - client-side logic
  *
- * This script fetches market data from CoinGecko, filters tokens that have
- * increased at least 100% over the last 24 hours (2x), and ranks them by
- * 24h trading volume. It also provides a simple search function and
- * interactive refresh.
+ * This script fetches market data from CoinGecko, including multiple pages
+ * of tokens ordered by 24h trading volume, combines it with trending search
+ * coins, computes a momentum score based on price change and volume, and
+ * then ranks tokens by this score. Trending coins are highlighted in the
+ * table. A search function and interactive refresh are provided.
  */
 
-// Global state for tokens data
+// Data arrays
 let tokens = [];
 let filteredTokens = [];
 
@@ -17,6 +18,7 @@ const tokensBody = document.getElementById("tokens-body");
 const searchInput = document.getElementById("search-input");
 const refreshButton = document.getElementById("refresh-button");
 const statusEl = document.getElementById("status");
+const scanEl = document.getElementById("scan-animation");
 
 // Utility: format large numbers with commas and abbreviations
 function formatNumber(value) {
@@ -37,36 +39,111 @@ function formatNumber(value) {
   return value.toLocaleString();
 }
 
-// Fetch data from CoinGecko
+// Fetch market and trending data from CoinGecko, compute a momentum score, and rank tokens.
 async function fetchData() {
   statusEl.textContent = "Fetching data...";
   statusEl.style.display = "block";
   tokensTable.classList.add("hidden");
+  // Show scanning animation
+  if (scanEl) {
+    scanEl.classList.remove("hidden");
+  }
   try {
-    const endpoint =
-      "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=250&page=1&price_change_percentage=24h";
-    const response = await fetch(endpoint);
-    if (!response.ok) {
-      throw new Error(`HTTP ${response.status}`);
-    }
-    const data = await response.json();
-    // Filter for tokens with price change >= 50% and non-zero volume
-    tokens = data.filter(
-      (token) =>
-        typeof token.price_change_percentage_24h === "number" &&
-        token.price_change_percentage_24h >= 50 &&
-        token.total_volume > 0
+    const pagesToFetch = 3; // number of pages (each page = 250 tokens)
+    const perPage = 250;
+    const pageNumbers = Array.from({ length: pagesToFetch }, (_, i) => i + 1);
+    // Build requests for each page ordered by 24h volume desc
+    const requests = pageNumbers.map((page) =>
+      fetch(
+        `https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=volume_desc&per_page=${perPage}&page=${page}&sparkline=false&price_change_percentage=24h`
+      )
     );
-    // Sort by 24h volume descending (higher volume first)
-    tokens.sort((a, b) => b.total_volume - a.total_volume);
+    // Fetch trending search coins
+    const trendingReq = fetch(
+      "https://api.coingecko.com/api/v3/search/trending"
+    );
+    // Await all responses
+    const responses = await Promise.all([...requests, trendingReq]);
+    // Extract JSON bodies
+    const dataResults = await Promise.all(
+      responses.slice(0, pagesToFetch).map((r) => {
+        if (!r.ok) {
+          throw new Error(`HTTP ${r.status}`);
+        }
+        return r.json();
+      })
+    );
+    // Flatten market data
+    let data = dataResults.flat();
+    // Handle trending search data
+    const trendingJson = await responses[pagesToFetch].json();
+    const trendingItems = Array.isArray(trendingJson.coins)
+      ? trendingJson.coins.map((c) => c.item)
+      : [];
+    let trendingMarketData = [];
+    if (trendingItems.length > 0) {
+      const trendingIds = trendingItems.map((item) => item.id).join(",");
+      const trendingMarketRes = await fetch(
+        `https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&ids=${trendingIds}&sparkline=false&price_change_percentage=24h`
+      );
+      if (trendingMarketRes.ok) {
+        trendingMarketData = await trendingMarketRes.json();
+      }
+    }
+    // Merge trending data into market data, marking trending coins
+    const byId = new Map();
+    data.forEach((token) => {
+      token.isTrending = false;
+      byId.set(token.id, token);
+    });
+    trendingMarketData.forEach((t) => {
+      if (byId.has(t.id)) {
+        byId.get(t.id).isTrending = true;
+      } else {
+        t.isTrending = true;
+        data.push(t);
+        byId.set(t.id, t);
+      }
+    });
+    // Compute a momentum score: price change * volume/market_cap (avoid division by zero)
+    data.forEach((token) => {
+      const priceChange =
+        typeof token.price_change_percentage_24h === "number"
+          ? token.price_change_percentage_24h
+          : 0;
+      const volumeRatio =
+        token.market_cap && token.market_cap > 0
+          ? token.total_volume / token.market_cap
+          : 0;
+      token.score = priceChange * volumeRatio;
+    });
+    // Filter out tokens with minimal activity (price change <= 0 or volume <= 0)
+    const filtered = data.filter(
+      (token) =>
+        token.total_volume > 0 && typeof token.score === "number" && token.score > 0
+    );
+    // Sort by score descending
+    filtered.sort((a, b) => b.score - a.score);
+    // Take top 100 tokens to display
+    const topTokens = filtered.slice(0, 100);
+    tokens = topTokens;
     filteredTokens = [...tokens];
     if (tokens.length === 0) {
       statusEl.textContent =
-        "No tokens found with 50% growth in the last 24 hours. Try again later.";
+        "No tokens found with significant momentum. Try again later.";
     } else {
+      // Compute max score to normalize probabilities
+      const maxScore = tokens[0].score || 0;
+      tokens.forEach((token) => {
+        token.probability = maxScore > 0 ? token.score / maxScore : 0;
+      });
       statusEl.style.display = "none";
       tokensTable.classList.remove("hidden");
       renderTable(filteredTokens);
+    }
+    // Hide scanning animation
+    if (scanEl) {
+      scanEl.classList.add("hidden");
     }
   } catch (error) {
     console.error("Error fetching data:", error);
@@ -80,8 +157,17 @@ function renderTable(list) {
   tokensBody.innerHTML = "";
   list.forEach((token) => {
     const row = document.createElement("tr");
-    // Name column with coin image and name
+    // Name column with coin image and name (and optional trending star)
     const nameCell = document.createElement("td");
+    // Add a star for trending tokens
+    if (token.isTrending) {
+      const star = document.createElement("span");
+      star.textContent = "★ ";
+      // Use accent color from CSS variables if available
+      const accentColor = getComputedStyle(document.documentElement).getPropertyValue('--accent-color').trim();
+      star.style.color = accentColor || "#00cc66";
+      nameCell.appendChild(star);
+    }
     const img = document.createElement("img");
     img.src = token.image;
     img.alt = `${token.name} logo`;
@@ -123,6 +209,24 @@ function renderTable(list) {
     capCell.classList.add("numeric");
     capCell.textContent = `$${formatNumber(token.market_cap)}`;
     row.appendChild(capCell);
+
+    // Moon Probability
+    const probCell = document.createElement("td");
+    probCell.classList.add("numeric");
+    const probPercent = token.probability ? (token.probability * 100).toFixed(1) : 0;
+    probCell.textContent = `${probPercent}%`;
+    // Color-code probability: greener for higher probability
+    const probValue = parseFloat(probPercent);
+    if (probValue >= 80) {
+      probCell.style.color = "#00ff00";
+    } else if (probValue >= 50) {
+      probCell.style.color = "#66ff66";
+    } else if (probValue >= 20) {
+      probCell.style.color = "#99ff99";
+    } else {
+      probCell.style.color = "#cccccc";
+    }
+    row.appendChild(probCell);
     tokensBody.appendChild(row);
   });
 }

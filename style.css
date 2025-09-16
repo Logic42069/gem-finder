@@ -1,14 +1,14 @@
 /* Root variables for colors and fonts */
 :root {
-  --primary-color: #d0e7ff; /* light blue background */
-  --accent-color: #00aaff; /* deeper blue for highlights */
-  --text-color: #ffffff; /* white text for dark backgrounds */
-  --background-color: #0f0f14; /* very dark blue/black */
-  --secondary-background: #1a1a25; /* slightly lighter dark for tables */
-  --border-color: #2a2a3c; /* subtle border color */
+  --primary-color: #00ff00; /* neon green text */
+  --accent-color: #00cc66; /* darker green for highlights */
+  --text-color: #00ff00; /* same as primary for consistency */
+  --background-color: #000000; /* black background */
+  --secondary-background: #0a0a0a; /* slightly lighter black for tables */
+  --border-color: #003300; /* dark green border */
   --radius: 8px;
   --transition-speed: 0.2s;
-  font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+  font-family: "Consolas", "Courier New", monospace;
 }
 
 /* Global styles */
@@ -87,7 +87,7 @@ main {
 }
 
 #refresh-button:hover {
-  background-color: #0088cc;
+  background-color: #009944;
 }
 
 /* Status message */
@@ -126,8 +126,9 @@ main {
   z-index: 1;
 }
 
+/* Row hover highlight */
 .tokens-table tr:hover {
-  background-color: #23233a;
+  background-color: #002200;
 }
 
 .tokens-table td.numeric {
@@ -151,4 +152,29 @@ footer a {
 
 footer a:hover {
   text-decoration: underline;
+}
+
+/* Scanning animation overlay */
+#scan-animation {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 4px;
+  background: linear-gradient(90deg, transparent, var(--accent-color), transparent);
+  animation: scanning 2s linear infinite;
+  z-index: 9999;
+}
+
+#scan-animation.hidden {
+  display: none;
+}
+
+@keyframes scanning {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(100%);
+  }
 }
