@@ -50,11 +50,11 @@ async function fetchData() {
       throw new Error(`HTTP ${response.status}`);
     }
     const data = await response.json();
-    // Filter for tokens with price change >= 100% (2x) and non-zero volume
+    // Filter for tokens with price change >= 50% and non-zero volume
     tokens = data.filter(
       (token) =>
         typeof token.price_change_percentage_24h === "number" &&
-        token.price_change_percentage_24h >= 100 &&
+        token.price_change_percentage_24h >= 50 &&
         token.total_volume > 0
     );
     // Sort by 24h volume descending (higher volume first)
@@ -62,7 +62,7 @@ async function fetchData() {
     filteredTokens = [...tokens];
     if (tokens.length === 0) {
       statusEl.textContent =
-        "No tokens found with 2x growth in the last 24 hours. Try again later.";
+        "No tokens found with 50% growth in the last 24 hours. Try again later.";
     } else {
       statusEl.style.display = "none";
       tokensTable.classList.remove("hidden");
