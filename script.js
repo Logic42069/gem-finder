@@ -148,6 +148,14 @@ async function fetchData() {
       let predictedAmplitude = category === "pumping" ? high24 - open24 : open24 - low24;
       // Skip tokens where we cannot determine a positive amplitude
       if (predictedAmplitude <= 0) continue;
+      // Calculate amplitude ratio relative to the open price. This measures how big
+      // the potential move is compared to the current price level.
+      const amplitudeRatio = predictedAmplitude / open24;
+      // Filter out tokens with very small potential moves (<5% of price) and minimal
+      // absolute 24h change (<5%). These are unlikely to offer significant momentum.
+      if (amplitudeRatio < 0.05 && Math.abs(priceChange24) < 5) {
+        continue;
+      }
       // Completion measures how far along the current move is relative to its predicted amplitude
       const completion = Math.max(
         0,
@@ -249,6 +257,12 @@ async function fetchData() {
           // Estimate predicted amplitude as the 24h trading range
           let amplitude = (high24 !== null && low24 !== null) ? (high24 - low24) : 0;
           if (!amplitude || amplitude <= 0) continue;
+          // Filter out tokens with tiny moves: require the 24h range to be at least 5% of the price
+          // and the absolute 24h price change to be at least 5%. This focuses on big movers.
+          const priceVal = price || 0;
+          const amplitudeRatioFallback = priceVal > 0 ? amplitude / priceVal : 0;
+          const absChange24 = Math.abs(priceChange24 || 0);
+          if (amplitudeRatioFallback < 0.05 && absChange24 < 5) continue;
           // Estimate completion using 1h price change when available. If not, use 24h change.
           let priceChange1h = 0;
           if (info.price_change_percentage_1h_in_currency !== undefined) {
@@ -316,11 +330,8 @@ async function fetchData() {
             const combined = aggregatedConverted.concat(fallbackAgg);
             // Sort by momentum score descending
             combined.sort((a, b) => b.momentumScore - a.momentumScore);
-            // Highlight the top 10% tokens
-            const combinedHighlightCt = Math.max(
-              1,
-              Math.round(combined.length * 0.1)
-            );
+            // Highlight the top 10 tokens (or fewer if not enough)
+            const combinedHighlightCt = Math.min(10, combined.length);
             combined.forEach((token, idx) => {
               token.highlight = idx < combinedHighlightCt;
             });
@@ -355,7 +366,8 @@ async function fetchData() {
     // Sort by momentum score descending
     aggregated.sort((a, b) => b.momentumScore - a.momentumScore);
     // Highlight top 10% tokens as clear movers
-    const highlightCount = Math.max(1, Math.round(aggregated.length * 0.1));
+    // Highlight only the top 10 tokens (or fewer if not enough)
+    const highlightCount = Math.min(10, aggregated.length);
     aggregated.forEach((token, index) => {
       token.highlight = index < highlightCount;
     });
