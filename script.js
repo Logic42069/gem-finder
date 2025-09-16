@@ -52,42 +52,66 @@ async function fetchData() {
     const pagesToFetch = 3; // number of pages (each page = 250 tokens)
     const perPage = 250;
     const pageNumbers = Array.from({ length: pagesToFetch }, (_, i) => i + 1);
-    // Build requests for each page ordered by 24h volume desc
-    const requests = pageNumbers.map((page) =>
-      fetch(
+    // Build requests for each page ordered by 24h volume desc. We'll wrap each fetch in a try/catch so one failing page doesn't abort the entire process.
+    const pagePromises = pageNumbers.map((page) => {
+      return fetch(
         `https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=volume_desc&per_page=${perPage}&page=${page}&sparkline=false&price_change_percentage=24h`
-      )
-    );
-    // Fetch trending search coins
-    const trendingReq = fetch(
+      ).catch(() => null);
+    });
+    // Fetch trending search coins with graceful error handling
+    const trendingPromise = fetch(
       "https://api.coingecko.com/api/v3/search/trending"
-    );
-    // Await all responses
-    const responses = await Promise.all([...requests, trendingReq]);
-    // Extract JSON bodies
-    const dataResults = await Promise.all(
-      responses.slice(0, pagesToFetch).map((r) => {
-        if (!r.ok) {
-          throw new Error(`HTTP ${r.status}`);
+    ).catch(() => null);
+    // Await all responses. Use Promise.allSettled to avoid rejecting if one fails
+    const responses = await Promise.all([...pagePromises, trendingPromise]);
+    // Extract JSON bodies for market pages that returned successfully
+    const dataResults = [];
+    for (let i = 0; i < pagesToFetch; i++) {
+      const res = responses[i];
+      if (res && res.ok) {
+        try {
+          const json = await res.json();
+          dataResults.push(json);
+        } catch (e) {
+          console.warn('Failed to parse page', i + 1, e);
         }
-        return r.json();
-      })
-    );
-    // Flatten market data
-    let data = dataResults.flat();
+      } else {
+        console.warn('Skipping page', i + 1, 'due to network error');
+      }
+    }
+    // Flatten market data. If no pages succeeded, set an empty array
+    let data = [];
+    if (dataResults.length > 0) {
+      data = dataResults.flat();
+    }
     // Handle trending search data
-    const trendingJson = await responses[pagesToFetch].json();
-    const trendingItems = Array.isArray(trendingJson.coins)
-      ? trendingJson.coins.map((c) => c.item)
-      : [];
+    let trendingItems = [];
+    const trendingRes = responses[pagesToFetch];
+    if (trendingRes && trendingRes.ok) {
+      try {
+        const trendingJson = await trendingRes.json();
+        if (Array.isArray(trendingJson.coins)) {
+          trendingItems = trendingJson.coins.map((c) => c.item);
+        }
+      } catch (e) {
+        console.warn('Failed to parse trending data', e);
+      }
+    } else {
+      // If trending request failed, we simply skip adding trending coins
+      console.warn('Trending request failed or returned non-OK response');
+    }
     let trendingMarketData = [];
     if (trendingItems.length > 0) {
       const trendingIds = trendingItems.map((item) => item.id).join(",");
-      const trendingMarketRes = await fetch(
-        `https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&ids=${trendingIds}&sparkline=false&price_change_percentage=24h`
-      );
-      if (trendingMarketRes.ok) {
-        trendingMarketData = await trendingMarketRes.json();
+      try {
+        const trendingMarketRes = await fetch(
+          `https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&ids=${trendingIds}&sparkline=false&price_change_percentage=24h`
+        );
+        if (trendingMarketRes.ok) {
+          trendingMarketData = await trendingMarketRes.json();
+        }
+      } catch (e) {
+        console.warn('Failed to fetch trending market data', e);
       }
     }
     // Merge trending data into market data, marking trending coins
