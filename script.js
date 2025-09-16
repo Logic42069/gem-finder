@@ -205,7 +205,16 @@ async function fetchData() {
         // Determine maximum volume for normalization
         let maxVol = 0;
         const fallbackAgg = [];
-        for (const info of markets) {
+            for (const info of markets) {
+              const nameLower = (info.name || "").toLowerCase();
+              // Skip tokens representing wrapped, bridged or stock versions to reduce duplicates
+              if (
+                nameLower.includes("wrapped") ||
+                nameLower.includes("bridged") ||
+                nameLower.includes("stock")
+              ) {
+                continue;
+              }
           const symbolLower = info.symbol ? info.symbol.toLowerCase() : "";
           if (stableSymbols.has(symbolLower)) continue;
           const totalVolume = info.total_volume || info.total_volume_usd || 0;
