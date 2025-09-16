@@ -39,7 +39,7 @@ function formatNumber(value) {
   return value.toLocaleString();
 }
 
-// Fetch market and trending data from CoinGecko, compute a momentum score, and rank tokens.
+// Fetch BloFin tickers and market data to build a volume‑focused ranking.
 async function fetchData() {
   statusEl.textContent = "Fetching data...";
   statusEl.style.display = "block";
@@ -49,91 +49,113 @@ async function fetchData() {
     scanEl.classList.remove("hidden");
   }
   try {
-    const pagesToFetch = 3; // number of pages (each page = 250 tokens)
-    const perPage = 250;
-    const pageNumbers = Array.from({ length: pagesToFetch }, (_, i) => i + 1);
-    // Build requests for each page ordered by 24h volume desc. We'll wrap each fetch in a try/catch so one failing page doesn't abort the entire process.
-    const pagePromises = pageNumbers.map((page) => {
-      // Include both 1h and 24h price change percentages so we can favor early momentum
-      return fetch(
-        `https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=volume_desc&per_page=${perPage}&page=${page}&sparkline=false&price_change_percentage=1h%2C24h`
-      ).catch(() => null);
-    });
-    // Fetch trending search coins with graceful error handling
-    const trendingPromise = fetch(
-      "https://api.coingecko.com/api/v3/search/trending"
-    ).catch(() => null);
-    // Await all responses. Use Promise.allSettled to avoid rejecting if one fails
-    const responses = await Promise.all([...pagePromises, trendingPromise]);
-    // Extract JSON bodies for market pages that returned successfully
-    const dataResults = [];
-    for (let i = 0; i < pagesToFetch; i++) {
-      const res = responses[i];
-      if (res && res.ok) {
-        try {
-          const json = await res.json();
-          dataResults.push(json);
-        } catch (e) {
-          console.warn('Failed to parse page', i + 1, e);
+    // Step 1: fetch BloFin spot tickers to determine which tokens are available and their volumes
+    let tickersData = [];
+    try {
+      const tickersRes = await fetch(
+        "https://api.coingecko.com/api/v3/exchanges/blofin_spot/tickers"
+      );
+      if (tickersRes.ok) {
+        const json = await tickersRes.json();
+        if (Array.isArray(json.tickers)) {
+          tickersData = json.tickers;
         }
       } else {
-        console.warn('Skipping page', i + 1, 'due to network error');
+        console.warn("BloFin tickers request returned non-OK response");
       }
+    } catch (e) {
+      console.warn("Failed to fetch BloFin tickers", e);
     }
-    // Flatten market data. If no pages succeeded, set an empty array
-    let data = [];
-    if (dataResults.length > 0) {
-      data = dataResults.flat();
+    // Build a map of coin_id to total BloFin volume (USD) and base symbol
+    const volumeMap = {};
+    tickersData.forEach((ticker) => {
+      // Exclude if no coin_id or no converted volume
+      const id = ticker.coin_id;
+      const volumeUsd =
+        ticker.converted_volume && ticker.converted_volume.usd
+          ? Number(ticker.converted_volume.usd)
+          : 0;
+      if (!id || !volumeUsd || isNaN(volumeUsd)) return;
+      if (!volumeMap[id]) {
+        volumeMap[id] = { volume: 0, base: ticker.base };
+      }
+      volumeMap[id].volume += volumeUsd;
+    });
+    // Exclude known stablecoins and tokens with zero volume
+    const stableIds = new Set([
+      // Known stablecoin identifiers to exclude
+      "tether",
+      "usd-coin",
+      "binance-usd",
+      "pax-dollar",
+      "dai",
+      "true-usd",
+      "frax",
+      "usdd",
+      "usdp",
+      "usdk",
+      "mimatic",
+      "fei-usd",
+      "gusd",
+      "harmony-usd",
+      "tusd",
+      "husd",
+      "lusd"
+    ]);
+    // Extract entries and filter out stable coins and zero volumes
+    let entries = Object.entries(volumeMap).filter(([, info]) => info.volume > 0);
+    entries = entries.filter(([id]) => !stableIds.has(id));
+    // Sort by volume descending and take top 100
+    entries.sort((a, b) => b[1].volume - a[1].volume);
+    const topEntries = entries.slice(0, 100);
+    const coinIds = topEntries.map(([id]) => id);
+    if (coinIds.length === 0) {
+      statusEl.textContent =
+        "No BloFin‑listed tokens with volume data available. Try again later.";
+      // Hide scanning animation
+      if (scanEl) scanEl.classList.add("hidden");
+      return;
     }
-    // Handle trending search data
+    // Step 2: fetch market data for these coin IDs
+    const idsParam = coinIds.join(",");
+    let marketData = [];
+    try {
+      const marketsRes = await fetch(
+        `https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&ids=${idsParam}&sparkline=false&price_change_percentage=1h%2C24h`
+      );
+      if (marketsRes.ok) {
+        marketData = await marketsRes.json();
+      } else {
+        console.warn("Market data request returned non-OK response");
+      }
+    } catch (e) {
+      console.warn("Failed to fetch market data", e);
+    }
+    // Step 3: fetch trending search data to highlight popular coins (optional)
     let trendingItems = [];
-    const trendingRes = responses[pagesToFetch];
-    if (trendingRes && trendingRes.ok) {
-      try {
+    try {
+      const trendingRes = await fetch(
+        "https://api.coingecko.com/api/v3/search/trending"
+      );
+      if (trendingRes.ok) {
         const trendingJson = await trendingRes.json();
         if (Array.isArray(trendingJson.coins)) {
           trendingItems = trendingJson.coins.map((c) => c.item);
         }
-      } catch (e) {
-        console.warn('Failed to parse trending data', e);
       }
-    } else {
-      // If trending request failed, we simply skip adding trending coins
-      console.warn('Trending request failed or returned non-OK response');
+    } catch (e) {
+      console.warn("Failed to fetch trending data", e);
     }
-    let trendingMarketData = [];
-    if (trendingItems.length > 0) {
-      const trendingIds = trendingItems.map((item) => item.id).join(",");
-      try {
-        const trendingMarketRes = await fetch(
-          `https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&ids=${trendingIds}&sparkline=false&price_change_percentage=24h`
-        );
-        if (trendingMarketRes.ok) {
-          trendingMarketData = await trendingMarketRes.json();
-        }
-      } catch (e) {
-        console.warn('Failed to fetch trending market data', e);
-      }
-    }
-    // Merge trending data into market data, marking trending coins
-    const byId = new Map();
-    data.forEach((token) => {
-      token.isTrending = false;
-      byId.set(token.id, token);
-    });
-    trendingMarketData.forEach((t) => {
-      if (byId.has(t.id)) {
-        byId.get(t.id).isTrending = true;
-      } else {
-        t.isTrending = true;
-        data.push(t);
-        byId.set(t.id, t);
-      }
-    });
-    // Compute category (pumping or dumping) and movement completion based on 24h price range.
-    // We approximate the open price using the 24h price change percentage and current price.
-    data.forEach((token) => {
-      // Use 1h and 24h price change percentages to determine short‑term direction
+    // Build a set of trending IDs for quick lookup
+    const trendingSet = new Set(trendingItems.map((item) => item.id));
+    // Combine market data with volume info and compute metrics
+    const resultTokens = [];
+    marketData.forEach((token) => {
+      const id = token.id;
+      const volumeInfo = volumeMap[id];
+      if (!volumeInfo) return;
+      const blofinVolume = volumeInfo.volume;
+      // 1h and 24h price changes
       const priceChange1h =
         typeof token.price_change_percentage_1h_in_currency === "number"
           ? token.price_change_percentage_1h_in_currency
@@ -144,56 +166,47 @@ async function fetchData() {
         typeof token.price_change_percentage_24h === "number"
           ? token.price_change_percentage_24h
           : 0;
-      // Approximate the opening price 24h ago: current_price / (1 + change24h/100)
-      const openPrice = priceChange24h !== -100
-        ? token.current_price / (1 + priceChange24h / 100)
-        : token.current_price;
-      // Compute category based on 1h change
+      // Exclude tokens with tiny 24h moves to remove stablecoins
+      if (Math.abs(priceChange24h) < 0.5) return;
+      // Compute BloFin share of total volume (percentage) and volume ratio relative to market cap
+      const totalVol = token.total_volume || 0;
+      const marketCap = token.market_cap || 0;
+      const blofinShare = totalVol > 0 ? (blofinVolume / totalVol) * 100 : 0;
+      const volumeRatio = marketCap > 0 ? blofinVolume / marketCap : 0;
+      // Category based on 1h change (pumping or dumping)
       let category = "neutral";
-      if (priceChange1h > 0) {
-        category = "pumping";
-      } else if (priceChange1h < 0) {
-        category = "dumping";
-      }
-      // Compute movement completion percentage
+      if (priceChange1h > 0) category = "pumping";
+      else if (priceChange1h < 0) category = "dumping";
+      // Predict the potential magnitude of the move using 24h change and BloFin volume share.
+      // The predicted amplitude grows as the 24h change grows and BloFin share increases.
+      const predictedAmplitude = Math.abs(priceChange24h) * (1 + blofinShare / 50);
+      // Completion reflects how much of this predicted move has already occurred based on the 1h change.
       let completion = 0;
-      if (category === "pumping") {
-        const moveRange = token.high_24h - openPrice;
-        const progress = token.current_price - openPrice;
-        if (moveRange > 0) {
-          completion = (progress / moveRange) * 100;
-        }
-      } else if (category === "dumping") {
-        const moveRange = openPrice - token.low_24h;
-        const progress = openPrice - token.current_price;
-        if (moveRange > 0) {
-          completion = (progress / moveRange) * 100;
-        }
+      if (predictedAmplitude > 0) {
+        completion = (Math.abs(priceChange1h) / predictedAmplitude) * 100;
       }
-      // Clamp completion between 0 and 100
+      // Clamp to 0–100
       completion = Math.max(0, Math.min(100, completion));
-      token.category = category;
-      token.completion = completion;
+      resultTokens.push({
+        ...token,
+        isTrending: trendingSet.has(token.id),
+        category,
+        completion,
+        blofinVolume,
+        blofinShare,
+        volumeRatio,
+        priceChange1h,
+        priceChange24h,
+      });
     });
-    // Filter to tokens likely available on Blofin: top 200 by market cap rank and non-zero volume
-    const filtered = data.filter(
-      (token) =>
-        token.total_volume > 0 &&
-        token.market_cap_rank &&
-        token.market_cap_rank <= 200 &&
-        token.high_24h &&
-        token.low_24h &&
-        typeof token.completion === "number"
-    );
-    // Sort tokens by completion descending to surface those closest to completing their move
-    filtered.sort((a, b) => b.completion - a.completion);
-    // Take top 100 tokens
-    const topTokens = filtered.slice(0, 100);
-    tokens = topTokens;
+    // Sort by blofinShare descending to surface tokens with high BloFin volume share
+    resultTokens.sort((a, b) => b.blofinShare - a.blofinShare);
+    // Keep top 100 tokens
+    tokens = resultTokens.slice(0, 100);
     filteredTokens = [...tokens];
     if (tokens.length === 0) {
       statusEl.textContent =
-        "No Blofin‑listed tokens with sufficient data found. Try again later.";
+        "No BloFin‑listed tokens with sufficient volume found. Try again later.";
     } else {
       statusEl.style.display = "none";
       tokensTable.classList.remove("hidden");
@@ -207,6 +220,7 @@ async function fetchData() {
     console.error("Error fetching data:", error);
     statusEl.textContent =
       "Failed to fetch data. Please check your internet connection or try again later.";
+    if (scanEl) scanEl.classList.add("hidden");
   }
 }
 
@@ -284,15 +298,33 @@ function renderTable(list) {
       maximumFractionDigits: 2,
     })}`;
     row.appendChild(priceCell);
-    // Volume
+    // BloFin Volume
     const volumeCell = document.createElement("td");
     volumeCell.classList.add("numeric");
-    volumeCell.textContent = `$${formatNumber(token.total_volume)}`;
+    volumeCell.textContent = `$${formatNumber(token.blofinVolume)}`;
     row.appendChild(volumeCell);
+    // BloFin Share
+    const shareCell = document.createElement("td");
+    shareCell.classList.add("numeric");
+    const share = token.blofinShare || 0;
+    shareCell.textContent = `${share.toFixed(2)}%`;
+    // Color-code share: highlight high share values
+    if (share >= 50) shareCell.style.color = "#00ff00";
+    else if (share >= 20) shareCell.style.color = "#66ff66";
+    else if (share >= 5) shareCell.style.color = "#99ff99";
+    else shareCell.style.color = "#cccccc";
+    row.appendChild(shareCell);
+    // 1h Change
+    const change1Cell = document.createElement("td");
+    change1Cell.classList.add("numeric");
+    const change1 = token.priceChange1h;
+    change1Cell.textContent = `${change1.toFixed(2)}%`;
+    change1Cell.style.color = change1 >= 0 ? "#00ff99" : "#ff4444";
+    row.appendChild(change1Cell);
     // 24h Change
     const changeCell = document.createElement("td");
     changeCell.classList.add("numeric");
-    const change = token.price_change_percentage_24h;
+    const change = token.priceChange24h;
     changeCell.textContent = `${change.toFixed(2)}%`;
     changeCell.style.color = change >= 0 ? "#00ff99" : "#ff4444";
     row.appendChild(changeCell);
