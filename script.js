@@ -54,8 +54,9 @@ async function fetchData() {
     const pageNumbers = Array.from({ length: pagesToFetch }, (_, i) => i + 1);
     // Build requests for each page ordered by 24h volume desc. We'll wrap each fetch in a try/catch so one failing page doesn't abort the entire process.
     const pagePromises = pageNumbers.map((page) => {
+      // Include both 1h and 24h price change percentages so we can favor early momentum
       return fetch(
-        `https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=volume_desc&per_page=${perPage}&page=${page}&sparkline=false&price_change_percentage=24h`
+        `https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=volume_desc&per_page=${perPage}&page=${page}&sparkline=false&price_change_percentage=1h%2C24h`
       ).catch(() => null);
     });
     // Fetch trending search coins with graceful error handling
@@ -129,17 +130,31 @@ async function fetchData() {
         byId.set(t.id, t);
       }
     });
-    // Compute a momentum score: price change * volume/market_cap (avoid division by zero)
+    // Compute a momentum score biased toward short-term movement.
+    // We favor the 1h percentage change, with a small contribution from the 24h change.
+    // Then multiply by the square root of the volume-to-market-cap ratio to dampen extremes.
     data.forEach((token) => {
-      const priceChange =
+      // Extract 1h and 24h price change percentages from the API response.
+      // CoinGecko returns keys like price_change_percentage_1h_in_currency or price_change_percentage_1h depending on the endpoint.
+      const priceChange1h =
+        typeof token.price_change_percentage_1h_in_currency === "number"
+          ? token.price_change_percentage_1h_in_currency
+          : typeof token.price_change_percentage_1h === "number"
+          ? token.price_change_percentage_1h
+          : 0;
+      const priceChange24h =
         typeof token.price_change_percentage_24h === "number"
           ? token.price_change_percentage_24h
           : 0;
+      // Calculate a relative volume ratio; use square root to compress range
       const volumeRatio =
         token.market_cap && token.market_cap > 0
-          ? token.total_volume / token.market_cap
+          ? Math.sqrt(token.total_volume / token.market_cap)
           : 0;
-      token.score = priceChange * volumeRatio;
+      // Apply a small contribution from 24h change and a bonus if the token is trending
+      const trendMultiplier = token.isTrending ? 1.5 : 1;
+      // Combine the components into a momentum score
+      token.score = (priceChange1h + 0.1 * priceChange24h) * volumeRatio * trendMultiplier;
     });
     // Filter out tokens with minimal activity (price change <= 0 or volume <= 0)
     const filtered = data.filter(
