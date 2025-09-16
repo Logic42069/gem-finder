@@ -205,17 +205,35 @@ async function fetchData() {
         // Determine maximum volume for normalization
         let maxVol = 0;
         const fallbackAgg = [];
-            for (const info of markets) {
-              const nameLower = (info.name || "").toLowerCase();
-              // Skip tokens representing wrapped, bridged or stock versions to reduce duplicates
-              if (
-                nameLower.includes("wrapped") ||
-                nameLower.includes("bridged") ||
-                nameLower.includes("stock")
-              ) {
-                continue;
-              }
-          const symbolLower = info.symbol ? info.symbol.toLowerCase() : "";
+        for (const info of markets) {
+          const nameLower = (info.name || "").toLowerCase();
+          // Use a single lowercase symbol variable for all checks
+          const symbolLower = (info.symbol || "").toLowerCase();
+          // Skip tokens representing wrapped, bridged or stock versions to reduce duplicates
+          if (
+            nameLower.includes("wrapped") ||
+            nameLower.includes("bridged") ||
+            nameLower.includes("stock") ||
+            // also skip common wrapped prefixes such as wETH, wBTC, wBNB etc. (4-5 letters)
+            (symbolLower.startsWith("w") && symbolLower.length <= 5)
+          ) {
+            continue;
+          }
+          // Skip derivative forms of major base coins (e.g., stETH, BETH, WBTC, etc.)
+          // Keep only the base symbols (eth, btc, bnb) and skip any token whose symbol contains
+          // one of these bases but is not exactly the base.
+          const bases = ["eth", "btc", "bnb"];
+          let skipDerivative = false;
+          for (const base of bases) {
+            if (symbolLower !== base && symbolLower.includes(base)) {
+              skipDerivative = true;
+              break;
+            }
+          }
+          if (skipDerivative) {
+            continue;
+          }
+          // Skip stablecoins
           if (stableSymbols.has(symbolLower)) continue;
           const totalVolume = info.total_volume || info.total_volume_usd || 0;
           if (!totalVolume || totalVolume <= 0) continue;
