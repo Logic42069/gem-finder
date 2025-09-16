@@ -171,7 +171,9 @@ async function fetchData() {
     // is never empty, since the crypto market always has movers. The fallback
     // computes a momentum score based on the 24h price range and volume ratio,
     // similar to the primary algorithm but without the BloFin-specific data.
-    if (aggregated.length === 0) {
+        // If very few BloFin perpetuals were found (<10), augment with a fallback
+        // list of general market tokens. This ensures the list is never empty.
+        if (aggregated.length < 10) {
       try {
         // Fetch up to 200 coins ordered by 24h volume from CoinGecko markets endpoint
         const fallbackPages = 2;
@@ -258,18 +260,55 @@ async function fetchData() {
         fallbackAgg.forEach((token, idx) => {
           token.highlight = idx < highlightCt;
         });
-        // Set tokens and render
-        tokens = fallbackAgg;
-        filteredTokens = [...tokens];
-        if (tokens.length > 0) {
-          statusEl.style.display = "none";
-          tokensTable.classList.remove("hidden");
-          renderTable(filteredTokens);
-        } else {
-          statusEl.textContent = "No market tokens available.";
-        }
-        if (scanEl) scanEl.classList.add("hidden");
-        return;
+            // Convert the BloFin aggregated tokens into a form comparable to fallbackAgg
+            // so we can merge them together. We reuse the maxVol from the fallback
+            // calculation for normalisation.
+            const aggregatedConverted = aggregated.map((t) => {
+              // Compute a momentum score similar to fallback tokens using
+              // predictedAmplitude, volume ratio and early factor.
+              // Normalise volume relative to the maximum fallback volume. Cap at 1
+              const volRatioAgg = maxVol > 0 ? Math.min(1, t.totalVolume / maxVol) : 1;
+              const earlyFactorAgg = 1 - t.completion / 100;
+              const momentumScoreAgg =
+                t.predictedAmplitude * volRatioAgg * earlyFactorAgg;
+              return {
+                name: t.base,
+                symbol: t.base,
+                image: "",
+                category: t.category,
+                completion: t.completion,
+                current_price: t.last,
+                totalVolume: t.totalVolume,
+                priceChange24: t.priceChange24,
+                amplitude: t.predictedAmplitude,
+                momentumScore: momentumScoreAgg,
+                highlight: false,
+              };
+            });
+            // Combine BloFin tokens and fallback tokens
+            const combined = aggregatedConverted.concat(fallbackAgg);
+            // Sort by momentum score descending
+            combined.sort((a, b) => b.momentumScore - a.momentumScore);
+            // Highlight the top 10% tokens
+            const combinedHighlightCt = Math.max(
+              1,
+              Math.round(combined.length * 0.1)
+            );
+            combined.forEach((token, idx) => {
+              token.highlight = idx < combinedHighlightCt;
+            });
+            // Set tokens and render
+            tokens = combined;
+            filteredTokens = [...tokens];
+            if (tokens.length > 0) {
+              statusEl.style.display = "none";
+              tokensTable.classList.remove("hidden");
+              renderTable(filteredTokens);
+            } else {
+              statusEl.textContent = "No market tokens available.";
+            }
+            if (scanEl) scanEl.classList.add("hidden");
+            return;
       } catch (fallbackErr) {
         console.warn("Fallback fetch failed", fallbackErr);
         statusEl.textContent = "Failed to fetch data. Please check your internet connection or try again later.";
