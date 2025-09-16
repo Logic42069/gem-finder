@@ -135,6 +135,15 @@ main {
   text-align: right;
 }
 
+/* Highlight rows for top momentum tokens */
+.highlight-row {
+  background-color: #222200;
+}
+
+.highlight-row td {
+  color: #ffff66;
+}
+
 /* Footer */
 footer {
   text-align: center;

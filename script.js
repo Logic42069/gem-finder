@@ -39,26 +39,74 @@ function formatNumber(value) {
   return value.toLocaleString();
 }
 
-// Fetch BloFin tickers and market data to build a volume‑focused ranking.
+// Fetch BloFin perpetual tickers and compute momentum‑based ranking.
 async function fetchData() {
   statusEl.textContent = "Fetching data...";
   statusEl.style.display = "block";
   tokensTable.classList.add("hidden");
-  // Show scanning animation
-  if (scanEl) {
-    scanEl.classList.remove("hidden");
-  }
+  if (scanEl) scanEl.classList.remove("hidden");
   try {
-    // Step 1: fetch BloFin spot tickers to determine which tokens are available and their volumes
-    let tickersData = [];
+    // Retrieve the list of all instruments and filter for perpetual (SWAP) contracts that are live
+    let instruments = [];
     try {
-      const tickersRes = await fetch(
-        "https://api.coingecko.com/api/v3/exchanges/blofin_spot/tickers"
+      const instRes = await fetch(
+        "https://openapi.blofin.com/api/v1/market/instruments"
       );
-      if (tickersRes.ok) {
-        const json = await tickersRes.json();
-        if (Array.isArray(json.tickers)) {
-          tickersData = json.tickers;
+      if (instRes.ok) {
+        const instJson = await instRes.json();
+        if (Array.isArray(instJson.data)) {
+          instruments = instJson.data.filter(
+            (inst) => inst.instType === "SWAP" && inst.state === "live"
+          );
+        }
+      } else {
+        console.warn("BloFin instruments request returned non-OK response");
+      }
+    } catch (e) {
+      console.warn("Failed to fetch BloFin instruments", e);
+    }
+    // Stable base currencies to exclude
+    const stableBases = new Set([
+      "USDT",
+      "USDC",
+      "USD",
+      "BUSD",
+      "DAI",
+      "TUSD",
+      "PAX",
+      "USDP",
+      "USDK",
+      "USDD",
+      "EUR",
+      "JPY",
+      "GBP",
+    ]);
+    // Group instrument IDs by base currency
+    const instrumentsByBase = {};
+    instruments.forEach((inst) => {
+      const base = inst.baseCurrency;
+      if (!base || stableBases.has(base)) return;
+      if (!instrumentsByBase[base]) instrumentsByBase[base] = [];
+      instrumentsByBase[base].push(inst.instId);
+    });
+    const baseCurrencies = Object.keys(instrumentsByBase);
+    if (baseCurrencies.length === 0) {
+      statusEl.textContent = "No BloFin perpetual instruments found.";
+      if (scanEl) scanEl.classList.add("hidden");
+      return;
+    }
+    // Fetch tickers for all SWAP instruments
+    const tickerMap = {};
+    try {
+      const tickRes = await fetch(
+        "https://openapi.blofin.com/api/v1/market/tickers?instType=SWAP"
+      );
+      if (tickRes.ok) {
+        const tickJson = await tickRes.json();
+        if (Array.isArray(tickJson.data)) {
+          tickJson.data.forEach((tick) => {
+            tickerMap[tick.instId] = tick;
+          });
         }
       } else {
         console.warn("BloFin tickers request returned non-OK response");
@@ -66,158 +114,149 @@ async function fetchData() {
     } catch (e) {
       console.warn("Failed to fetch BloFin tickers", e);
     }
-    // Build a map of coin_id to total BloFin volume (USD) and base symbol
-    const volumeMap = {};
-    tickersData.forEach((ticker) => {
-      // Exclude if no coin_id or no converted volume
-      const id = ticker.coin_id;
-      const volumeUsd =
-        ticker.converted_volume && ticker.converted_volume.usd
-          ? Number(ticker.converted_volume.usd)
-          : 0;
-      if (!id || !volumeUsd || isNaN(volumeUsd)) return;
-      if (!volumeMap[id]) {
-        volumeMap[id] = { volume: 0, base: ticker.base };
-      }
-      volumeMap[id].volume += volumeUsd;
-    });
-    // Exclude known stablecoins and tokens with zero volume
-    const stableIds = new Set([
-      // Known stablecoin identifiers to exclude
-      "tether",
-      "usd-coin",
-      "binance-usd",
-      "pax-dollar",
-      "dai",
-      "true-usd",
-      "frax",
-      "usdd",
-      "usdp",
-      "usdk",
-      "mimatic",
-      "fei-usd",
-      "gusd",
-      "harmony-usd",
-      "tusd",
-      "husd",
-      "lusd"
-    ]);
-    // Extract entries and filter out stable coins and zero volumes
-    let entries = Object.entries(volumeMap).filter(([, info]) => info.volume > 0);
-    entries = entries.filter(([id]) => !stableIds.has(id));
-    // Sort by volume descending and take top 100
-    entries.sort((a, b) => b[1].volume - a[1].volume);
-    const topEntries = entries.slice(0, 100);
-    const coinIds = topEntries.map(([id]) => id);
-    if (coinIds.length === 0) {
-      statusEl.textContent =
-        "No BloFin‑listed tokens with volume data available. Try again later.";
-      // Hide scanning animation
+    // Aggregate metrics by base currency
+    const aggregated = [];
+    let maxVolume = 0;
+    for (const base of baseCurrencies) {
+      const instIds = instrumentsByBase[base];
+      let totalVolume = 0;
+      let primaryTicker = null;
+      instIds.forEach((instId) => {
+        const tick = tickerMap[instId];
+        if (!tick) return;
+        const vol = parseFloat(tick.volCurrency24h);
+        if (isNaN(vol)) return;
+        totalVolume += vol;
+        if (!primaryTicker || parseFloat(primaryTicker.volCurrency24h) < vol) {
+          primaryTicker = tick;
+        }
+      });
+      if (!primaryTicker || totalVolume <= 0) continue;
+      maxVolume = Math.max(maxVolume, totalVolume);
+      const last = parseFloat(primaryTicker.last);
+      const open24 = parseFloat(primaryTicker.open24h);
+      const high24 = parseFloat(primaryTicker.high24h);
+      const low24 = parseFloat(primaryTicker.low24h);
+      if (!open24 || !high24 || !low24 || !last) continue;
+      const priceChange24 = ((last - open24) / open24) * 100;
+      const category = priceChange24 >= 0 ? "pumping" : "dumping";
+      let predictedAmplitude = category === "pumping" ? high24 - open24 : open24 - low24;
+      if (predictedAmplitude <= 0) continue;
+      const completion = Math.max(
+        0,
+        Math.min(100, (Math.abs(last - open24) / predictedAmplitude) * 100)
+      );
+      aggregated.push({
+        base,
+        totalVolume,
+        last,
+        open24,
+        high24,
+        low24,
+        priceChange24,
+        category,
+        completion,
+      });
+    }
+    if (aggregated.length === 0) {
+      statusEl.textContent = "No BloFin perpetual tokens with sufficient volume.";
       if (scanEl) scanEl.classList.add("hidden");
       return;
     }
-    // Step 2: fetch market data for these coin IDs
-    const idsParam = coinIds.join(",");
-    let marketData = [];
-    try {
-      const marketsRes = await fetch(
-        `https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&ids=${idsParam}&sparkline=false&price_change_percentage=1h%2C24h`
-      );
-      if (marketsRes.ok) {
-        marketData = await marketsRes.json();
-      } else {
-        console.warn("Market data request returned non-OK response");
-      }
-    } catch (e) {
-      console.warn("Failed to fetch market data", e);
-    }
-    // Step 3: fetch trending search data to highlight popular coins (optional)
-    let trendingItems = [];
-    try {
-      const trendingRes = await fetch(
-        "https://api.coingecko.com/api/v3/search/trending"
-      );
-      if (trendingRes.ok) {
-        const trendingJson = await trendingRes.json();
-        if (Array.isArray(trendingJson.coins)) {
-          trendingItems = trendingJson.coins.map((c) => c.item);
-        }
-      }
-    } catch (e) {
-      console.warn("Failed to fetch trending data", e);
-    }
-    // Build a set of trending IDs for quick lookup
-    const trendingSet = new Set(trendingItems.map((item) => item.id));
-    // Combine market data with volume info and compute metrics
-    const resultTokens = [];
-    marketData.forEach((token) => {
-      const id = token.id;
-      const volumeInfo = volumeMap[id];
-      if (!volumeInfo) return;
-      const blofinVolume = volumeInfo.volume;
-      // 1h and 24h price changes
-      const priceChange1h =
-        typeof token.price_change_percentage_1h_in_currency === "number"
-          ? token.price_change_percentage_1h_in_currency
-          : typeof token.price_change_percentage_1h === "number"
-          ? token.price_change_percentage_1h
-          : 0;
-      const priceChange24h =
-        typeof token.price_change_percentage_24h === "number"
-          ? token.price_change_percentage_24h
-          : 0;
-      // Exclude tokens with tiny 24h moves to remove stablecoins
-      if (Math.abs(priceChange24h) < 0.5) return;
-      // Compute BloFin share of total volume (percentage) and volume ratio relative to market cap
-      const totalVol = token.total_volume || 0;
-      const marketCap = token.market_cap || 0;
-      const blofinShare = totalVol > 0 ? (blofinVolume / totalVol) * 100 : 0;
-      const volumeRatio = marketCap > 0 ? blofinVolume / marketCap : 0;
-      // Category based on 1h change (pumping or dumping)
-      let category = "neutral";
-      if (priceChange1h > 0) category = "pumping";
-      else if (priceChange1h < 0) category = "dumping";
-      // Predict the potential magnitude of the move using 24h change and BloFin volume share.
-      // The predicted amplitude grows as the 24h change grows and BloFin share increases.
-      const predictedAmplitude = Math.abs(priceChange24h) * (1 + blofinShare / 50);
-      // Completion reflects how much of this predicted move has already occurred based on the 1h change.
-      let completion = 0;
-      if (predictedAmplitude > 0) {
-        completion = (Math.abs(priceChange1h) / predictedAmplitude) * 100;
-      }
-      // Clamp to 0–100
-      completion = Math.max(0, Math.min(100, completion));
-      resultTokens.push({
-        ...token,
-        isTrending: trendingSet.has(token.id),
-        category,
-        completion,
-        blofinVolume,
-        blofinShare,
-        volumeRatio,
-        priceChange1h,
-        priceChange24h,
-      });
+    // Compute momentum score: emphasise high volume, large price movement, and early completion
+    aggregated.forEach((token) => {
+      const volRatio = maxVolume > 0 ? token.totalVolume / maxVolume : 0;
+      const magnitude = Math.abs(token.priceChange24);
+      const earlyFactor = 1 - token.completion / 100;
+      token.momentumScore = volRatio * magnitude * earlyFactor;
     });
-    // Sort by blofinShare descending to surface tokens with high BloFin volume share
-    resultTokens.sort((a, b) => b.blofinShare - a.blofinShare);
-    // Keep top 100 tokens
-    tokens = resultTokens.slice(0, 100);
+    // Sort by momentum score descending
+    aggregated.sort((a, b) => b.momentumScore - a.momentumScore);
+    // Highlight top 10% tokens as clear movers
+    const highlightCount = Math.max(1, Math.round(aggregated.length * 0.1));
+    aggregated.forEach((token, index) => {
+      token.highlight = index < highlightCount;
+    });
+    // Map base symbols to CoinGecko IDs
+    let coinList = [];
+    try {
+      const listRes = await fetch(
+        "https://api.coingecko.com/api/v3/coins/list?include_platform=false"
+      );
+      if (listRes.ok) {
+        coinList = await listRes.json();
+      }
+    } catch (e) {
+      console.warn("Failed to fetch CoinGecko coin list", e);
+    }
+    const symbolToIds = {};
+    coinList.forEach((c) => {
+      const sym = c.symbol.toLowerCase();
+      if (!symbolToIds[sym]) symbolToIds[sym] = [];
+      symbolToIds[sym].push(c.id);
+    });
+    // Select IDs for aggregated tokens
+    const idMap = {};
+    const idsToFetch = [];
+    aggregated.forEach((token) => {
+      const symLower = token.base.toLowerCase();
+      const ids = symbolToIds[symLower];
+      if (ids && ids.length > 0) {
+        // pick the first ID for now; if multiple, will refine later
+        const chosenId = ids[0];
+        idMap[token.base] = chosenId;
+        idsToFetch.push(chosenId);
+      }
+    });
+    // Fetch market data for selected IDs to get names/images/market cap
+    let marketInfo = [];
+    if (idsToFetch.length > 0) {
+      const uniqueIds = Array.from(new Set(idsToFetch)).slice(0, 150);
+      const idsParam2 = uniqueIds.join(",");
+      try {
+        const marketsRes = await fetch(
+          `https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&ids=${idsParam2}&sparkline=false&price_change_percentage=24h`
+        );
+        if (marketsRes.ok) {
+          marketInfo = await marketsRes.json();
+        }
+      } catch (e) {
+        console.warn("Failed to fetch CoinGecko market info", e);
+      }
+    }
+    // Map id to details
+    const idDetails = {};
+    marketInfo.forEach((info) => {
+      idDetails[info.id] = info;
+    });
+    // Build final token objects with names/images, falling back to symbol if missing
+    tokens = aggregated.map((token) => {
+      const coinId = idMap[token.base];
+      const details = coinId ? idDetails[coinId] : null;
+      return {
+        name: details ? details.name : token.base,
+        symbol: token.base,
+        image: details ? details.image : "",
+        category: token.category,
+        completion: token.completion,
+        current_price: token.last,
+        totalVolume: token.totalVolume,
+        priceChange24: token.priceChange24,
+        highlight: token.highlight,
+        momentumScore: token.momentumScore,
+      };
+    });
     filteredTokens = [...tokens];
     if (tokens.length === 0) {
-      statusEl.textContent =
-        "No BloFin‑listed tokens with sufficient volume found. Try again later.";
+      statusEl.textContent = "No BloFin perpetual tokens available.";
     } else {
       statusEl.style.display = "none";
       tokensTable.classList.remove("hidden");
       renderTable(filteredTokens);
     }
-    // Hide scanning animation
-    if (scanEl) {
-      scanEl.classList.add("hidden");
-    }
-  } catch (error) {
-    console.error("Error fetching data:", error);
+    if (scanEl) scanEl.classList.add("hidden");
+  } catch (err) {
+    console.error("Error during fetchData:", err);
     statusEl.textContent =
       "Failed to fetch data. Please check your internet connection or try again later.";
     if (scanEl) scanEl.classList.add("hidden");
@@ -229,53 +268,44 @@ function renderTable(list) {
   tokensBody.innerHTML = "";
   list.forEach((token) => {
     const row = document.createElement("tr");
-    // Name column with coin image and name (and optional trending star)
-    const nameCell = document.createElement("td");
-    // Add a star for trending tokens
-    if (token.isTrending) {
-      const star = document.createElement("span");
-      star.textContent = "★ ";
-      // Use accent color from CSS variables if available
-      const accentColor = getComputedStyle(document.documentElement).getPropertyValue('--accent-color').trim();
-      star.style.color = accentColor || "#00cc66";
-      nameCell.appendChild(star);
+    // Apply highlight style for clear movers
+    if (token.highlight) {
+      row.classList.add("highlight-row");
     }
-    const img = document.createElement("img");
-    img.src = token.image;
-    img.alt = `${token.name} logo`;
-    img.width = 24;
-    img.height = 24;
-    img.style.verticalAlign = "middle";
-    img.style.marginRight = "8px";
-    nameCell.appendChild(img);
-    const nameText = document.createElement("span");
-    nameText.textContent = token.name;
-    nameCell.appendChild(nameText);
+    // Name cell with optional image
+    const nameCell = document.createElement("td");
+    if (token.image) {
+      const img = document.createElement("img");
+      img.src = token.image;
+      img.alt = `${token.name} logo`;
+      img.width = 24;
+      img.height = 24;
+      img.style.verticalAlign = "middle";
+      img.style.marginRight = "8px";
+      nameCell.appendChild(img);
+    }
+    const nameSpan = document.createElement("span");
+    nameSpan.textContent = token.name;
+    nameCell.appendChild(nameSpan);
     row.appendChild(nameCell);
-    // Symbol
+    // Symbol cell
     const symbolCell = document.createElement("td");
     symbolCell.textContent = token.symbol.toUpperCase();
     row.appendChild(symbolCell);
-    // Category (pumping, dumping, neutral)
+    // Category cell
     const catCell = document.createElement("td");
-    let catLabel = token.category ? token.category.charAt(0).toUpperCase() + token.category.slice(1) : "Neutral";
+    const catLabel = token.category ? token.category.charAt(0).toUpperCase() + token.category.slice(1) : "Neutral";
     catCell.textContent = catLabel;
-    // Set category color: green for pumping, red for dumping, gray for neutral
-    if (token.category === "pumping") {
-      catCell.style.color = "#00ff99";
-    } else if (token.category === "dumping") {
-      catCell.style.color = "#ff4444";
-    } else {
-      catCell.style.color = "#cccccc";
-    }
+    if (token.category === "pumping") catCell.style.color = "#00ff99";
+    else if (token.category === "dumping") catCell.style.color = "#ff4444";
+    else catCell.style.color = "#cccccc";
     row.appendChild(catCell);
-    // Completion percentage
+    // Completion cell
     const completionCell = document.createElement("td");
     completionCell.classList.add("numeric");
-    const compPercent = token.completion ? token.completion.toFixed(1) : 0;
-    completionCell.textContent = `${compPercent}%`;
-    // Color-code completion: if pumping, greener as it approaches 100%; if dumping, redder as it approaches 100%
-    const compValue = parseFloat(compPercent);
+    const comp = token.completion ? token.completion.toFixed(1) : "0.0";
+    completionCell.textContent = `${comp}%`;
+    const compValue = parseFloat(comp);
     if (token.category === "pumping") {
       if (compValue >= 80) completionCell.style.color = "#00ff00";
       else if (compValue >= 50) completionCell.style.color = "#66ff66";
@@ -290,7 +320,7 @@ function renderTable(list) {
       completionCell.style.color = "#cccccc";
     }
     row.appendChild(completionCell);
-    // Price
+    // Price cell
     const priceCell = document.createElement("td");
     priceCell.classList.add("numeric");
     priceCell.textContent = `$${Number(token.current_price).toLocaleString(undefined, {
@@ -298,41 +328,18 @@ function renderTable(list) {
       maximumFractionDigits: 2,
     })}`;
     row.appendChild(priceCell);
-    // BloFin Volume
-    const volumeCell = document.createElement("td");
-    volumeCell.classList.add("numeric");
-    volumeCell.textContent = `$${formatNumber(token.blofinVolume)}`;
-    row.appendChild(volumeCell);
-    // BloFin Share
-    const shareCell = document.createElement("td");
-    shareCell.classList.add("numeric");
-    const share = token.blofinShare || 0;
-    shareCell.textContent = `${share.toFixed(2)}%`;
-    // Color-code share: highlight high share values
-    if (share >= 50) shareCell.style.color = "#00ff00";
-    else if (share >= 20) shareCell.style.color = "#66ff66";
-    else if (share >= 5) shareCell.style.color = "#99ff99";
-    else shareCell.style.color = "#cccccc";
-    row.appendChild(shareCell);
-    // 1h Change
-    const change1Cell = document.createElement("td");
-    change1Cell.classList.add("numeric");
-    const change1 = token.priceChange1h;
-    change1Cell.textContent = `${change1.toFixed(2)}%`;
-    change1Cell.style.color = change1 >= 0 ? "#00ff99" : "#ff4444";
-    row.appendChild(change1Cell);
-    // 24h Change
-    const changeCell = document.createElement("td");
-    changeCell.classList.add("numeric");
-    const change = token.priceChange24h;
-    changeCell.textContent = `${change.toFixed(2)}%`;
-    changeCell.style.color = change >= 0 ? "#00ff99" : "#ff4444";
-    row.appendChild(changeCell);
-    // Market Cap
-    const capCell = document.createElement("td");
-    capCell.classList.add("numeric");
-    capCell.textContent = `$${formatNumber(token.market_cap)}`;
-    row.appendChild(capCell);
+    // Volume cell
+    const volCell = document.createElement("td");
+    volCell.classList.add("numeric");
+    volCell.textContent = `$${formatNumber(token.totalVolume)}`;
+    row.appendChild(volCell);
+    // 24h Change cell
+    const change24Cell = document.createElement("td");
+    change24Cell.classList.add("numeric");
+    const chg = token.priceChange24;
+    change24Cell.textContent = `${chg.toFixed(2)}%`;
+    change24Cell.style.color = chg >= 0 ? "#00ff99" : "#ff4444";
+    row.appendChild(change24Cell);
     tokensBody.appendChild(row);
   });
 }
