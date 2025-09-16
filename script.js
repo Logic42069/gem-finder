@@ -132,16 +132,23 @@ async function fetchData() {
         }
       });
       if (!primaryTicker || totalVolume <= 0) continue;
+      // Track the maximum volume observed across all base currencies for later normalization
       maxVolume = Math.max(maxVolume, totalVolume);
       const last = parseFloat(primaryTicker.last);
       const open24 = parseFloat(primaryTicker.open24h);
       const high24 = parseFloat(primaryTicker.high24h);
       const low24 = parseFloat(primaryTicker.low24h);
+      // Ensure we have valid numeric values to work with
       if (!open24 || !high24 || !low24 || !last) continue;
+      // Calculate the 24h price change (percentage) to determine category (pumping/dumping)
       const priceChange24 = ((last - open24) / open24) * 100;
       const category = priceChange24 >= 0 ? "pumping" : "dumping";
+      // Predicted amplitude is the potential move size from open24h to the 24h high (for pumps)
+      // or from open24h to the 24h low (for dumps). This approximates how big the move can get.
       let predictedAmplitude = category === "pumping" ? high24 - open24 : open24 - low24;
+      // Skip tokens where we cannot determine a positive amplitude
       if (predictedAmplitude <= 0) continue;
+      // Completion measures how far along the current move is relative to its predicted amplitude
       const completion = Math.max(
         0,
         Math.min(100, (Math.abs(last - open24) / predictedAmplitude) * 100)
@@ -156,6 +163,7 @@ async function fetchData() {
         priceChange24,
         category,
         completion,
+        predictedAmplitude,
       });
     }
     if (aggregated.length === 0) {
@@ -163,12 +171,14 @@ async function fetchData() {
       if (scanEl) scanEl.classList.add("hidden");
       return;
     }
-    // Compute momentum score: emphasise high volume, large price movement, and early completion
+    // Compute momentum score: emphasise high predicted amplitude, significant volume and how early the move is
+    // Momentum probability combines the predicted amplitude (potential move size),
+    // the relative volume share on BloFin and an early factor indicating how far along the move is.
     aggregated.forEach((token) => {
       const volRatio = maxVolume > 0 ? token.totalVolume / maxVolume : 0;
-      const magnitude = Math.abs(token.priceChange24);
       const earlyFactor = 1 - token.completion / 100;
-      token.momentumScore = volRatio * magnitude * earlyFactor;
+      // Multiply predictedAmplitude by volume ratio and early factor to get momentum probability
+      token.momentumScore = token.predictedAmplitude * volRatio * earlyFactor;
     });
     // Sort by momentum score descending
     aggregated.sort((a, b) => b.momentumScore - a.momentumScore);
