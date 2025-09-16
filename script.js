@@ -166,10 +166,116 @@ async function fetchData() {
         predictedAmplitude,
       });
     }
+    // If no tokens were aggregated from BloFin perpetuals, fall back to a more general
+    // algorithm using top market-cap tokens from CoinGecko. This ensures the list
+    // is never empty, since the crypto market always has movers. The fallback
+    // computes a momentum score based on the 24h price range and volume ratio,
+    // similar to the primary algorithm but without the BloFin-specific data.
     if (aggregated.length === 0) {
-      statusEl.textContent = "No BloFin perpetual tokens with sufficient volume.";
-      if (scanEl) scanEl.classList.add("hidden");
-      return;
+      try {
+        // Fetch up to 200 coins ordered by 24h volume from CoinGecko markets endpoint
+        const fallbackPages = 2;
+        let markets = [];
+        for (let page = 1; page <= fallbackPages; page++) {
+          const url = `https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=volume_desc&per_page=100&page=${page}&sparkline=false&price_change_percentage=1h,24h`;
+          const res = await fetch(url);
+          if (res.ok) {
+            const data = await res.json();
+            if (Array.isArray(data)) markets = markets.concat(data);
+          }
+        }
+        // Filter out stablecoins
+        const stableSymbols = new Set([
+          "usdt",
+          "usdc",
+          "usd",
+          "busd",
+          "dai",
+          "tusd",
+          "pax",
+          "usdp",
+          "usdk",
+          "usdd",
+          "eur",
+          "jpy",
+          "gbp",
+        ]);
+        // Determine maximum volume for normalization
+        let maxVol = 0;
+        const fallbackAgg = [];
+        for (const info of markets) {
+          const symbolLower = info.symbol ? info.symbol.toLowerCase() : "";
+          if (stableSymbols.has(symbolLower)) continue;
+          const totalVolume = info.total_volume || info.total_volume_usd || 0;
+          if (!totalVolume || totalVolume <= 0) continue;
+          maxVol = Math.max(maxVol, totalVolume);
+          const high24 = info.high_24h;
+          const low24 = info.low_24h;
+          const price = info.current_price;
+          const priceChange24 = info.price_change_percentage_24h_in_currency !== undefined
+            ? info.price_change_percentage_24h_in_currency
+            : info.price_change_percentage_24h;
+          // Determine pumping/dumping based on 24h change
+          const category = priceChange24 >= 0 ? "pumping" : "dumping";
+          // Estimate predicted amplitude as the 24h trading range
+          let amplitude = (high24 !== null && low24 !== null) ? (high24 - low24) : 0;
+          if (!amplitude || amplitude <= 0) continue;
+          // Estimate completion using 1h price change when available. If not, use 24h change.
+          let priceChange1h = 0;
+          if (info.price_change_percentage_1h_in_currency !== undefined) {
+            priceChange1h = Math.abs(info.price_change_percentage_1h_in_currency);
+          } else if (info.price_change_percentage_1h !== undefined) {
+            priceChange1h = Math.abs(info.price_change_percentage_1h);
+          } else {
+            priceChange1h = Math.abs(priceChange24) / 24; // rough approximation
+          }
+          // Completion as ratio of recent movement to total predicted amplitude (clamped 0-100)
+          const completion = Math.max(
+            0,
+            Math.min(100, (priceChange1h / Math.abs(priceChange24 || 1e-6)) * 100)
+          );
+          fallbackAgg.push({
+            name: info.name,
+            symbol: info.symbol ? info.symbol.toUpperCase() : info.id,
+            image: info.image || "",
+            category,
+            completion,
+            current_price: price,
+            totalVolume: totalVolume,
+            priceChange24: priceChange24 || 0,
+            amplitude,
+          });
+        }
+        // Compute momentum score for fallback tokens
+        fallbackAgg.forEach((token) => {
+          const volRatio = maxVol > 0 ? token.totalVolume / maxVol : 0;
+          const earlyFactor = 1 - token.completion / 100;
+          token.momentumScore = token.amplitude * volRatio * earlyFactor;
+        });
+        // Sort and highlight top 10%
+        fallbackAgg.sort((a, b) => b.momentumScore - a.momentumScore);
+        const highlightCt = Math.max(1, Math.round(fallbackAgg.length * 0.1));
+        fallbackAgg.forEach((token, idx) => {
+          token.highlight = idx < highlightCt;
+        });
+        // Set tokens and render
+        tokens = fallbackAgg;
+        filteredTokens = [...tokens];
+        if (tokens.length > 0) {
+          statusEl.style.display = "none";
+          tokensTable.classList.remove("hidden");
+          renderTable(filteredTokens);
+        } else {
+          statusEl.textContent = "No market tokens available.";
+        }
+        if (scanEl) scanEl.classList.add("hidden");
+        return;
+      } catch (fallbackErr) {
+        console.warn("Fallback fetch failed", fallbackErr);
+        statusEl.textContent = "Failed to fetch data. Please check your internet connection or try again later.";
+        if (scanEl) scanEl.classList.add("hidden");
+        return;
+      }
     }
     // Compute momentum score: emphasise high predicted amplitude, significant volume and how early the move is
     // Momentum probability combines the predicted amplitude (potential move size),
